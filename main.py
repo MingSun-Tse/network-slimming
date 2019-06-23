@@ -1,5 +1,6 @@
 from __future__ import print_function
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 import argparse
 import shutil
 import numpy as np
@@ -44,7 +45,7 @@ parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
 parser.add_argument('--log-interval', type=int, default=100, metavar='N',
                     help='how many batches to wait before logging training status')
-parser.add_argument('--save', default='./logs', type=str, metavar='PATH',
+parser.add_argument('--save', default='./test', type=str, metavar='PATH',
                     help='path to save prune model (default: current directory)')
 parser.add_argument('--arch', default='vgg', type=str, 
                     help='architecture to use')
@@ -128,6 +129,56 @@ def updateBN():
         if isinstance(m, nn.BatchNorm2d):
             m.weight.grad.data.add_(args.s*torch.sign(m.weight.data))  # L1
 
+# -----------------------------------------------------------------------
+# Integrate the idea of IncReg to network slimming
+TARGET_REG = 0.01
+AA = 1e-6
+PR = 0.7
+Reg = {}
+IF_chl_alive = {}
+num_pruned_chl = {}
+NUM_SHOW = 20
+
+def punish_func(r, num_g, thre_rank):
+  if r <= thre_rank:
+    return AA - AA/thre_rank * r
+  else:
+    return -AA / (num_g - 1 - thre_rank) * (r - thre_rank)
+
+def updateBN_IncReg():
+  bn_cnt = -1
+  for m in model.modules():
+    if isinstance(m, nn.BatchNorm2d):
+      bn_cnt += 1; layer_ix = str(bn_cnt)
+      num_chl = m.weight.data.shape[0]
+      if layer_ix not in Reg:
+        Reg[layer_ix] = [0] * num_chl
+        IF_chl_alive[layer_ix] = [1] * num_chl
+        num_pruned_chl[layer_ix] = 0
+      
+      # sort
+      abs_scale = m.weight.data.abs()
+      sort_index = abs_scale.sort()[1]
+      
+      num_chl_ = num_chl - num_pruned_chl[layer_ix]
+      num_chl_to_prune_ = int(num_chl * PR) - num_pruned_chl[layer_ix]
+      for i in range(num_chl_):
+        chl_of_rank_i = sort_index[i + num_pruned_chl[layer_ix]]
+        Delta = punish_func(i, num_chl_, num_chl_to_prune_)
+        Reg[layer_ix][chl_of_rank_i] = max(Reg[layer_ix][chl_of_rank_i] + Delta, 0)
+        if Reg[layer_ix][chl_of_rank_i] >= TARGET_REG:
+          IF_chl_alive[layer_ix][chl_of_rank_i] = 0
+          m.weight.data[chl_of_rank_i] = 0
+          num_pruned_chl[layer_ix][chl_of_rank_i] += 1
+          
+      # apply reg to bn weights
+      reg_new = torch.from_numpy(np.array(Reg[layer_ix])).float().cuda()
+      m.weight.grad.data.add_(reg_new * m.weight.data) # use L2
+      tmp = torch.from_numpy(np.array(IF_chl_alive[layer_ix])).float().cuda()
+      m.weight.grad.data.mul_(tmp)
+# -----------------------------------------------------------------------      
+  
+
 def train(epoch):
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
@@ -140,12 +191,29 @@ def train(epoch):
         pred = output.data.max(1, keepdim=True)[1]
         loss.backward()
         if args.sr:
-            updateBN()
+            updateBN_IncReg()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.1f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader), loss.data[0]))
+                100. * batch_idx / len(train_loader), loss.item()))
+            # print bn reg
+            for i in range(len(Reg.keys())):
+              print("the bn reg * 1e4 of layer %2d:" % i, end=" ")
+              for k in range(NUM_SHOW):
+                if k >= len(Reg[str(i)]): break
+                v = Reg[str(i)][k]
+                print("%.3f" % (v * 1e4), end=" ")
+              print("")
+            # print bn weight
+            cnt = -1
+            for m in model.modules():
+              if isinstance(m, nn.BatchNorm2d):
+                cnt += 1
+                print("the bn weight of layer %2d:" % cnt, end=" ")
+                for i in range(NUM_SHOW):
+                  print("%.4f" % m.weight.data[i].item(), end=" ")
+                print("")
 
 def test():
     model.eval()
@@ -156,7 +224,7 @@ def test():
             data, target = data.cuda(), target.cuda()
         data, target = Variable(data, volatile=True), Variable(target)
         output = model(data)
-        test_loss += F.cross_entropy(output, target, size_average=False).data[0] # sum up batch loss
+        test_loss += F.cross_entropy(output, target, size_average=False).item() # sum up batch loss
         pred = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
         correct += pred.eq(target.data.view_as(pred)).cpu().sum()
 
