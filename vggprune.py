@@ -1,4 +1,5 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 import argparse
 import numpy as np
 import torch
@@ -62,7 +63,7 @@ for m in model.modules():
 
 y, i = torch.sort(bn)
 thre_index = int(total * args.percent)
-thre = y[thre_index]
+thre = y[thre_index].cuda()
 
 pruned = 0
 cfg = []
