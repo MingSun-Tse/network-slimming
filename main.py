@@ -114,10 +114,10 @@ if args.resume:
     if os.path.isfile(args.resume):
         print("=> loading checkpoint '{}'".format(args.resume))
         checkpoint = torch.load(args.resume)
-        args.start_epoch = checkpoint['epoch']
+        # args.start_epoch = checkpoint['epoch']
         best_prec1 = checkpoint['best_prec1']
         model.load_state_dict(checkpoint['state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        # optimizer.load_state_dict(checkpoint['optimizer'])
         print("=> loaded checkpoint '{}' (epoch {}) Prec1: {:f}"
               .format(args.resume, checkpoint['epoch'], best_prec1))
     else:
@@ -131,13 +131,15 @@ def updateBN():
 
 # -----------------------------------------------------------------------
 # Integrate the idea of IncReg to network slimming
-TARGET_REG = 0.01
-AA = 1e-6
+TARGET_REG = 1.0
+AA = 0.5e-4
 PR = 0.7
 Reg = {}
 IF_chl_alive = {}
 num_pruned_chl = {}
 NUM_SHOW = 20
+IF_layer_finished = {}
+pruned_ratio = {}
 
 def punish_func(r, num_g, thre_rank):
   if r <= thre_rank:
@@ -151,31 +153,42 @@ def updateBN_IncReg():
     if isinstance(m, nn.BatchNorm2d):
       bn_cnt += 1; layer_ix = str(bn_cnt)
       num_chl = m.weight.data.shape[0]
+      
+      # initialization/registration
       if layer_ix not in Reg:
         Reg[layer_ix] = [0] * num_chl
         IF_chl_alive[layer_ix] = [1] * num_chl
         num_pruned_chl[layer_ix] = 0
+        pruned_ratio[layer_ix] = 0
+        IF_layer_finished[layer_ix] = 0
+        
+      num_pruned_chl_ = num_pruned_chl[layer_ix]
+      num_chl_ = num_chl - num_pruned_chl_
+      num_chl_to_prune_ = int(num_chl * PR) - num_pruned_chl_
       
-      # sort
-      abs_scale = m.weight.data.abs()
-      sort_index = abs_scale.sort()[1]
-      
-      num_chl_ = num_chl - num_pruned_chl[layer_ix]
-      num_chl_to_prune_ = int(num_chl * PR) - num_pruned_chl[layer_ix]
-      for i in range(num_chl_):
-        chl_of_rank_i = sort_index[i + num_pruned_chl[layer_ix]]
-        Delta = punish_func(i, num_chl_, num_chl_to_prune_)
-        Reg[layer_ix][chl_of_rank_i] = max(Reg[layer_ix][chl_of_rank_i] + Delta, 0)
-        if Reg[layer_ix][chl_of_rank_i] >= TARGET_REG:
-          IF_chl_alive[layer_ix][chl_of_rank_i] = 0
-          m.weight.data[chl_of_rank_i] = 0
-          num_pruned_chl[layer_ix][chl_of_rank_i] += 1
+      if num_chl_to_prune_ > 0:
+        # sort
+        abs_scale = m.weight.data.abs()
+        sort_index = abs_scale.sort()[1]
+
+        for i in range(num_chl_):
+          chl_of_rank_i = sort_index[i + num_pruned_chl_]
+          Delta = punish_func(i, num_chl_, num_chl_to_prune_)
+          Reg[layer_ix][chl_of_rank_i] = max(Reg[layer_ix][chl_of_rank_i] + Delta, 0)
+          if Reg[layer_ix][chl_of_rank_i] >= TARGET_REG:
+            IF_chl_alive[layer_ix][chl_of_rank_i] = 0
+            num_pruned_chl[layer_ix] += 1
+            pruned_ratio[layer_ix] = num_pruned_chl[layer_ix] / num_chl
+            IF_layer_finished[layer_ix] = 1
           
-      # apply reg to bn weights
-      reg_new = torch.from_numpy(np.array(Reg[layer_ix])).float().cuda()
-      m.weight.grad.data.add_(reg_new * m.weight.data) # use L2
+        # apply reg to bn weights
+        reg_new = torch.from_numpy(np.array(Reg[layer_ix])).float().cuda()
+        m.weight.grad.data.add_(reg_new * m.weight.data) # use L2
+      
+      # mask out the gradient
       tmp = torch.from_numpy(np.array(IF_chl_alive[layer_ix])).float().cuda()
       m.weight.grad.data.mul_(tmp)
+      m.weight.data.mul_(tmp)
 # -----------------------------------------------------------------------      
   
 
@@ -199,20 +212,21 @@ def train(epoch):
                 100. * batch_idx / len(train_loader), loss.item()))
             # print bn reg
             for i in range(len(Reg.keys())):
-              print("the bn reg * 1e4 of layer %2d:" % i, end=" ")
+              print("the bn reg of layer %2d:" % i, end=" ")
               for k in range(NUM_SHOW):
                 if k >= len(Reg[str(i)]): break
                 v = Reg[str(i)][k]
-                print("%.3f" % (v * 1e4), end=" ")
-              print("")
+                print("%.4f" % v, end=" ")
+              print("pruned_ratio: %.4f" % pruned_ratio[str(i)])
+            
             # print bn weight
             cnt = -1
             for m in model.modules():
               if isinstance(m, nn.BatchNorm2d):
-                cnt += 1
+                cnt += 1; layer_ix = str(cnt)
                 print("the bn weight of layer %2d:" % cnt, end=" ")
                 for i in range(NUM_SHOW):
-                  print("%.4f" % m.weight.data[i].item(), end=" ")
+                  print("%.4f (%s)" % (abs(m.weight.data[i].item()), IF_chl_alive[layer_ix][i]), end=" ")
                 print("")
 
 def test():
@@ -254,5 +268,4 @@ for epoch in range(args.start_epoch, args.epochs):
         'best_prec1': best_prec1,
         'optimizer': optimizer.state_dict(),
     }, is_best, filepath=args.save)
-
 print("Best accuracy: "+str(best_prec1))
